@@ -21,7 +21,11 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  resumableTask,
+  storageDegraded,
   runAlignment,
+  resumeTask,
+  discardTask,
   recalculate,
   updateRow,
   shiftPairing,
@@ -70,6 +74,14 @@ const rowSelection = computed(() => ({
   selectedRowKeys: selectedRowIds.value,
   onlyCurrent: false
 }));
+
+const resumePercent = computed(() => {
+  const task = resumableTask.value;
+  if (!task || !task.totalUnits) return 0;
+  return Math.round((task.processedUnits / task.totalUnits) * 100);
+});
+
+const resumeFailed = computed(() => resumableTask.value?.status === 'failed');
 
 watch(
   selectedRow,
@@ -233,20 +245,23 @@ window.addEventListener('beforeunload', beforeUnload);
             </a-select>
             <a-button long type="outline" @click="runAlignment()">执行分片自动对齐</a-button>
           </div>
-          <a-progress v-if="processing" :percent="progress" size="small" style="margin-top: 12px" />
+          <a-progress v-if="processing || resumableTask" :percent="processing ? progress : resumePercent" size="small" style="margin-top: 12px" />
           <div v-if="processing" style="margin-top: 6px; color: #86909c; font-size: 12px">
             正在让出主线程，长文本编辑不会一直卡住
+          </div>
+          <div v-else-if="resumableTask" style="margin-top: 6px; color: #86909c; font-size: 12px">
+            检测到未完成的对齐任务，可从断点继续
           </div>
         </section>
 
         <section class="panel-section">
           <h2 class="panel-title">比较规则</h2>
           <a-space direction="vertical" fill>
-            <a-checkbox v-model="rules.ignorePunctuation" @change="recalculate">忽略标点差异</a-checkbox>
-            <a-checkbox v-model="rules.ignoreVariants" @change="recalculate">忽略常见异体字</a-checkbox>
+            <a-checkbox v-model="rules.ignorePunctuation">忽略标点差异</a-checkbox>
+            <a-checkbox v-model="rules.ignoreVariants">忽略常见异体字</a-checkbox>
           </a-space>
           <div style="margin-top: 10px; color: #86909c; font-size: 12px; line-height: 1.6">
-            规则只影响相同/改动判断，原始正文始终保留；重算会进入撤销历史。
+            规则只影响相同/改动判断，原始正文始终保留；重算会进入撤销历史。规则变更会立即作废正在进行的对齐任务。
           </div>
         </section>
 
@@ -288,6 +303,33 @@ window.addEventListener('beforeunload', beforeUnload);
       </a-layout-sider>
 
       <a-layout-content class="center-panel">
+        <a-alert
+          v-if="resumableTask"
+          :type="resumeFailed ? 'error' : 'info'"
+          :show-icon="true"
+          style="margin-bottom: 12px"
+        >
+          <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; width: 100%">
+            <div style="flex: 1; min-width: 200px">
+              <template v-if="resumeFailed">
+                对齐任务已停止：连续 {{ resumableTask.errorCount }} 次分片执行失败（{{ resumableTask.lastError }}）。
+              </template>
+              <template v-else>
+                检测到未完成的对齐任务：已完成 {{ resumePercent }}%（{{ resumableTask.processedUnits }} / {{ resumableTask.totalUnits }} 句段），可从断点继续。
+              </template>
+            </div>
+            <a-button size="small" type="primary" @click="resumeTask">{{ resumeFailed ? '重试对齐' : '从断点继续' }}</a-button>
+            <a-button size="small" @click="discardTask">放弃任务</a-button>
+          </div>
+        </a-alert>
+        <a-alert
+          v-if="storageDegraded"
+          type="warning"
+          :show-icon="true"
+          style="margin-bottom: 12px"
+        >
+          浏览器本地容量不足，已降级为精简保存（正文、校记与接受判断仍保留）。建议尽快导出 JSON 校勘数据备份。
+        </a-alert>
         <a-card :bordered="false" style="margin-bottom: 12px">
           <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap">
             <a-input-search v-model="rowQuery" placeholder="搜索正文、校记或来源" allow-clear style="max-width: 360px" />
