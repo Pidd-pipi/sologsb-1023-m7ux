@@ -15,6 +15,10 @@ const {
   processing,
   progress,
   message,
+  checkpoint,
+  storageWarning,
+  estimatedBatches,
+  failedCheckpoint,
   canUndo,
   canRedo,
   selectedRow,
@@ -22,6 +26,8 @@ const {
   acceptedCount,
   unresolvedCount,
   runAlignment,
+  resumeAlignment,
+  dismissStorageWarning,
   recalculate,
   updateRow,
   shiftPairing,
@@ -101,6 +107,12 @@ function onSelectionChange(keys: (string | number)[]) {
 function updateStatus(status: unknown) {
   if (!selectedRow.value) return;
   updateRow(selectedRow.value.id, { status: String(status) as DifferenceStatus });
+}
+
+function onRulesChange() {
+  // 对齐进行中改规则会立即作废旧任务，因此处理中不触发重算
+  if (processing.value) return;
+  recalculate();
 }
 
 function onRowClick(record: Record<string, unknown>) {
@@ -206,7 +218,7 @@ window.addEventListener('beforeunload', beforeUnload);
           <a-button :disabled="!canUndo" @click="undo">撤销</a-button>
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
-          <a-button @click="openImport">导入版本</a-button>
+          <a-button :disabled="processing" @click="openImport">导入版本</a-button>
           <a-dropdown>
             <a-button>导出校勘记</a-button>
             <template #content>
@@ -223,30 +235,46 @@ window.addEventListener('beforeunload', beforeUnload);
         <section class="panel-section">
           <h2 class="panel-title">比对版本</h2>
           <div style="display: grid; gap: 10px">
-            <a-select v-model="leftVersionId" aria-label="底本">
+            <a-select v-model="leftVersionId" aria-label="底本" :disabled="processing">
               <template #prefix>底本</template>
               <a-option v-for="version in versions" :key="version.id" :value="version.id">{{ version.name }}</a-option>
             </a-select>
-            <a-select v-model="rightVersionId" aria-label="参校本">
+            <a-select v-model="rightVersionId" aria-label="参校本" :disabled="processing">
               <template #prefix>参校</template>
               <a-option v-for="version in versions" :key="version.id" :value="version.id">{{ version.name }}</a-option>
             </a-select>
-            <a-button long type="outline" @click="runAlignment()">执行分片自动对齐</a-button>
+            <a-button long type="outline" :loading="processing" @click="runAlignment()">执行分批自动对齐</a-button>
           </div>
-          <a-progress v-if="processing" :percent="progress" size="small" style="margin-top: 12px" />
+          <a-progress v-if="processing || checkpoint" :percent="progress" :status="failedCheckpoint ? 'danger' : 'normal'" size="small" style="margin-top: 12px" />
           <div v-if="processing" style="margin-top: 6px; color: #86909c; font-size: 12px">
-            正在让出主线程，长文本编辑不会一直卡住
+            每批 24 个句段，已完成 {{ checkpoint?.batchesDone ?? 0 }} / 约 {{ estimatedBatches }} 批；长文本编辑不会一直卡住
           </div>
+          <div v-else-if="checkpoint" style="margin-top: 6px; color: #86909c; font-size: 12px">
+            {{ checkpoint.status === 'failed' ? '失败' : '中断' }}断点停在第 {{ (checkpoint.batchesDone ?? 0) + 1 }} 批（{{ progress }}%）
+            <a-button v-if="checkpoint.status === 'interrupted'" size="mini" type="outline" style="margin-left: 6px" @click="resumeAlignment">
+              从断点继续
+            </a-button>
+          </div>
+          <a-alert v-if="failedCheckpoint" type="error" :show-icon="true" style="margin-top: 10px">
+            <template #title>对齐在第 {{ failedCheckpoint.batchesDone + 1 }} 批连续三次异常后停止</template>
+            <div style="line-height: 1.7">
+              原因：{{ failedCheckpoint.error || '未知异常' }}<br />
+              已保存的校记和接受判断不受影响，可从该片断点重试。
+            </div>
+            <a-button size="small" type="primary" status="danger" style="margin-top: 8px" @click="resumeAlignment">
+              从断点继续对齐
+            </a-button>
+          </a-alert>
         </section>
 
         <section class="panel-section">
           <h2 class="panel-title">比较规则</h2>
           <a-space direction="vertical" fill>
-            <a-checkbox v-model="rules.ignorePunctuation" @change="recalculate">忽略标点差异</a-checkbox>
-            <a-checkbox v-model="rules.ignoreVariants" @change="recalculate">忽略常见异体字</a-checkbox>
+            <a-checkbox v-model="rules.ignorePunctuation" :disabled="processing" @change="onRulesChange">忽略标点差异</a-checkbox>
+            <a-checkbox v-model="rules.ignoreVariants" :disabled="processing" @change="onRulesChange">忽略常见异体字</a-checkbox>
           </a-space>
           <div style="margin-top: 10px; color: #86909c; font-size: 12px; line-height: 1.6">
-            规则只影响相同/改动判断，原始正文始终保留；重算会进入撤销历史。
+            规则只影响相同/改动判断，原始正文始终保留；对齐进行中修改规则会立即作废旧任务。
           </div>
         </section>
 
@@ -270,10 +298,10 @@ window.addEventListener('beforeunload', beforeUnload);
               <div class="stat-label">对齐句段</div>
             </div>
           </div>
-          <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount" @click="acceptAll">
+          <a-button long type="primary" status="success" style="margin-top: 12px" :disabled="!unresolvedCount || processing" @click="acceptAll">
             批量接受全部建议
           </a-button>
-          <a-button long style="margin-top: 8px" @click="nextDifference">跳到下一处未接受差异</a-button>
+          <a-button long style="margin-top: 8px" :disabled="processing" @click="nextDifference">跳到下一处未接受差异</a-button>
         </section>
 
         <section class="panel-section">
@@ -300,6 +328,7 @@ window.addEventListener('beforeunload', beforeUnload);
               status="success"
               size="small"
               style="margin-left: auto"
+              :disabled="processing"
               @click="acceptRows(selectedRowIds.map(String))"
             >
               接受勾选建议
@@ -308,8 +337,18 @@ window.addEventListener('beforeunload', beforeUnload);
         </a-card>
 
         <a-card :bordered="false" :body-style="{ padding: 0 }">
-          <a-alert :show-icon="processing" :type="unresolvedCount ? 'warning' : 'success'" style="border-radius: 0">
-            {{ message }}<span v-if="unresolvedCount"> · {{ unresolvedCount }} 条差异尚未接受</span>
+          <a-alert
+            v-if="storageWarning"
+            type="warning"
+            :show-icon="true"
+            closable
+            style="border-radius: 0"
+            @close="dismissStorageWarning"
+          >
+            {{ storageWarning }}
+          </a-alert>
+          <a-alert :show-icon="processing || !!failedCheckpoint" :type="failedCheckpoint ? 'error' : unresolvedCount ? 'warning' : 'success'" style="border-radius: 0">
+            {{ message }}<span v-if="unresolvedCount"> · {{ unresolvedCount }} 条差异尚未接受</span><span v-if="processing"> · 第 {{ checkpoint?.batchesDone ?? 0 }} 批</span>
           </a-alert>
           <a-table
             class="virtual-table"
@@ -346,12 +385,12 @@ window.addEventListener('beforeunload', beforeUnload);
 
             <template #align="{ record }">
               <a-space direction="vertical" size="mini">
-                <a-button size="mini" @click.stop="shiftPairing(record.id, -1)">配对上移</a-button>
-                <a-button size="mini" @click.stop="shiftPairing(record.id, 1)">配对下移</a-button>
-                <a-button size="mini" @click.stop="moveRow(record.id, -1)">整行上移</a-button>
-                <a-button size="mini" @click.stop="moveRow(record.id, 1)">整行下移</a-button>
+                <a-button size="mini" :disabled="processing" @click.stop="shiftPairing(record.id, -1)">配对上移</a-button>
+                <a-button size="mini" :disabled="processing" @click.stop="shiftPairing(record.id, 1)">配对下移</a-button>
+                <a-button size="mini" :disabled="processing" @click.stop="moveRow(record.id, -1)">整行上移</a-button>
+                <a-button size="mini" :disabled="processing" @click.stop="moveRow(record.id, 1)">整行下移</a-button>
                 <a-tooltip content="接受这一行的自动判断">
-                  <a-button size="mini" status="success" @click.stop="acceptRows([record.id])">接受</a-button>
+                  <a-button size="mini" status="success" :disabled="processing" @click.stop="acceptRows([record.id])">接受</a-button>
                 </a-tooltip>
               </a-space>
             </template>
@@ -393,7 +432,7 @@ window.addEventListener('beforeunload', beforeUnload);
         <template v-if="selectedRow">
           <section class="panel-section">
             <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">判断类别</div>
-            <a-select :model-value="selectedRow.status" style="width: 100%" @change="updateStatus">
+            <a-select :model-value="selectedRow.status" style="width: 100%" :disabled="processing" @change="updateStatus">
               <a-option value="same">相同</a-option>
               <a-option value="changed">改动</a-option>
               <a-option value="added">右侧新增</a-option>
@@ -417,16 +456,16 @@ window.addEventListener('beforeunload', beforeUnload);
               :auto-size="{ minRows: 5, maxRows: 10 }"
             />
             <a-input v-model="sourceDraft" placeholder="来源，如：某刻本、某整理者" style="margin-top: 10px" />
-            <a-button long type="primary" style="margin-top: 10px" @click="saveAnnotation">保存校勘说明</a-button>
+            <a-button long type="primary" style="margin-top: 10px" :disabled="processing" @click="saveAnnotation">保存校勘说明</a-button>
           </section>
 
           <section class="panel-section">
             <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">错位修正</div>
             <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px">
-              <a-button @click="shiftPairing(selectedRow.id, -1)">配对向前</a-button>
-              <a-button @click="shiftPairing(selectedRow.id, 1)">配对向后</a-button>
-              <a-button @click="moveRow(selectedRow.id, -1)">整行上移</a-button>
-              <a-button @click="moveRow(selectedRow.id, 1)">整行下移</a-button>
+              <a-button :disabled="processing" @click="shiftPairing(selectedRow.id, -1)">配对向前</a-button>
+              <a-button :disabled="processing" @click="shiftPairing(selectedRow.id, 1)">配对向后</a-button>
+              <a-button :disabled="processing" @click="moveRow(selectedRow.id, -1)">整行上移</a-button>
+              <a-button :disabled="processing" @click="moveRow(selectedRow.id, 1)">整行下移</a-button>
             </div>
             <a-alert type="info" style="margin-top: 10px" :show-icon="true">
               配对移动只交换左栏句段，不会改写底本或参校本原文。
@@ -438,6 +477,7 @@ window.addEventListener('beforeunload', beforeUnload);
               long
               :status="selectedRow.accepted ? 'normal' : 'success'"
               :type="selectedRow.accepted ? 'outline' : 'primary'"
+              :disabled="processing"
               @click="updateRow(selectedRow.id, { accepted: !selectedRow.accepted })"
             >
               {{ selectedRow.accepted ? '撤回接受状态' : '接受这条校勘建议' }}
